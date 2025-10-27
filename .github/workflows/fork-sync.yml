@@ -3,14 +3,9 @@ name: 同步上游 Release 与 Wiki
 on:
   workflow_dispatch:  # 手动触发，也可加 schedule 实现定时同步
 
-permissions:
-  contents: write
-  workflows: write
-
 env:
-  UPSTREAM_REPO: 2dust/v2ray      # ← 上游仓库
-  FORK_REPO: xixuangezu/v2ray          # ← 自己的仓库
-  TEMP_DIR: ~/temp            # ← 临时目录，你也可以改成其他名字
+  FORK_REPO: ${{ github.repository }}
+  TEMP_DIR: ~/temp
 
 jobs:
   sync:
@@ -19,16 +14,31 @@ jobs:
     steps:
     - name: 开启错误详细
       run: |
-        # set -euxo pipefail
+        set -euxo pipefail
 
     - name: 安装 GitHub CLI
       run: |
         sudo apt-get update
         sudo apt-get install -y gh
 
-    - name: 登录 GH CLI（使用 GITHUB_TOKEN）
+    - name: 登录 GH CLI(使用 GITHUB_TOKEN 或 自行添加 PAT_TOKEN)
       run: |
-        echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+        echo "${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+        echo "GH_TOKEN=${{ secrets.PAT_TOKEN != '' && secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+
+    - name: checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: 获取上游仓库名
+      run: |
+        echo "UPSTREAM_REPO=$(gh repo view --json parent | jq -r '"\(.parent.owner.login)/\(.parent.name)"')" >> $GITHUB_ENV
+
+    - name: 仓库名
+      run: |
+        echo "FORK_REPO=$FORK_REPO"
+        echo "UPSTREAM_REPO=$UPSTREAM_REPO"
 
     - name: 清理/准备临时目录
       run: |
@@ -41,11 +51,11 @@ jobs:
     - name: 同步 Wiki
       run: |
         # 克隆上游 Wiki(Wiki 是独立的 .wiki 仓库)
-        git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$UPSTREAM_REPO.wiki.git $TEMP_DIR/wiki
+        git clone https://x-access-token:$GH_TOKEN@github.com/$UPSTREAM_REPO.wiki.git $TEMP_DIR/wiki
         cd $TEMP_DIR/wiki
 
         # 切换远程地址到自己仓库的 Wiki
-        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$FORK_REPO.wiki.git
+        git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/$FORK_REPO.wiki.git
 
         # 强制推送所有分支和标签
         git push origin --all --force
@@ -59,11 +69,11 @@ jobs:
         TAG_PUSH_SKIP=0
 
         # 克隆上游主仓库以获取所有 tag
-        git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$UPSTREAM_REPO.git $TEMP_DIR/repo
+        git clone https://x-access-token:$GH_TOKEN@github.com/$UPSTREAM_REPO.git $TEMP_DIR/repo
         cd $TEMP_DIR/repo
         git fetch --tags
         # 将 origin 指向自己的仓库
-        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$FORK_REPO.git
+        git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/$FORK_REPO.git
         # 遍历所有上游 tag 存在就跳过 不存在才推
         for tag in $(git tag); do
           if git ls-remote --exit-code --tags origin $tag >/dev/null; then
@@ -102,9 +112,25 @@ jobs:
 
           echo "=== 同步 Release: $tag ==="
           # 下载上游 Release 的所有附件
-          if !gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag ; then
-            echo "download $tag 失败，跳过"
-            RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1)) # 统计失败
+          gh release download -R $UPSTREAM_REPO --pattern '*' -D $TEMP_DIR/releases $tag || true
+
+          if ! ls $TEMP_DIR/releases/* 1> /dev/null 2>&1; then
+            # 尝试仅同步说明
+            title=$(gh release view -R $UPSTREAM_REPO $tag --json name -q .name)
+            body=$(gh release view -R $UPSTREAM_REPO $tag --json body -q .body)
+            isPrerelease=$(gh release view -R $UPSTREAM_REPO $tag --json isPrerelease -q .isPrerelease)
+
+            # 创建 Release(不带附件)
+            if gh release create -R $FORK_REPO $tag \
+              --title "$title" \
+              --notes "$body" \
+              $( [ "$isPrerelease" = "true" ] && echo "--prerelease" ); then
+              RELEASE_CREATE_SUCCESS=$((RELEASE_CREATE_SUCCESS+1)) # 统计成功
+            else
+              echo "create Release $tag 失败，跳过"
+              RELEASE_CREATE_FAILURE=$((RELEASE_CREATE_FAILURE+1)) # 统计失败
+            fi
+            rm -rf $TEMP_DIR $TEMP_DIR/releases/*
             continue
           fi
 
